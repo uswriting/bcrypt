@@ -7,7 +7,7 @@
 
 ## Abstract
 
-This document details our modern implementation of the bcrypt password hashing algorithm in JavaScript/TypeScript. In response to well-documented vulnerabilities in legacy libraries[^1][^2], our implementation adheres strictly to the bcrypt 2b specification, enforces opinionated input validation, and is designed for compatibility with established libraries. The aim is to provide a secure, maintainable, and high-assurance cryptographic library suitable for modern applications.
+This document details our modern implementation of the bcrypt password hashing algorithm in JavaScript/TypeScript. In response to well-documented vulnerabilities in legacy libraries[^1][^2], our implementation adheres strictly to the bcrypt 2b specification, enforces opinionated input validation, and is designed for compatibility with established libraries. The aim is to provide a secure, maintainable, and high-assurance bcrypt library suitable for modern applications.
 
 ---
 

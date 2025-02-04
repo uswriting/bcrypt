@@ -6,7 +6,7 @@ type Enumerate<N extends number, Acc extends number[] = []> = Acc['length'] exte
     : Enumerate<N, [...Acc, Acc['length']]>;
 
 type IntRange<F extends number, T extends number> = Exclude<Enumerate<T>, Enumerate<F>>
-type VALID_COST = IntRange<typeof MIN_COST, typeof MAX_COST>
+type VALID_COST = IntRange<4, 32>
 
 
 const MAX_PW_LENGTH = 72; // Maximum allowed bytes (including null terminator)

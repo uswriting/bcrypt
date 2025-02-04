@@ -1,6 +1,6 @@
 # A Modern, Secure Implementation of bcrypt for JavaScript/TypeScript
 
-**Version:** 1.0.0  
+**Version:** 1.0.1  
 **Date:** 2025-02-04
 
 ---

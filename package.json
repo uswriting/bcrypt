@@ -1,0 +1,43 @@
+{
+  "name": "@uswriting/bcrypt",
+  "version": "1.0.0",
+  "description": "A sample TypeScript library.",
+  "main": "dist/cjs/index.cjs",
+  "module": "dist/esm/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build:esbuild": "bun run build.ts",
+    "build:types": "tsc --emitDeclarationOnly --outDir ./dist",
+    "build": "npm run clean && npm run build:esbuild && npm run build:types",
+    "test": "vitest"
+  },
+  "type": "module",
+  "peerDependencies": {
+    "typescript": "5.7.3"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "bcryptjs": "^2.4.3",
+    "vitest": "^3.0.5",
+    "esbuild": "^0.24.2"
+  },
+  "repository": "https://github.com/uswriting/bcrypt/",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/uswriting/bcrypt/issues",
+    "email": "code@uswriting.co"
+  },
+  "dependencies": {
+    
+  }
+}

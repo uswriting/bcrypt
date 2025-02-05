@@ -1,15 +1,79 @@
 const MIN_COST = 4 as const;
 const MAX_COST = 31 as const;
 
-type Enumerate<N extends number, Acc extends number[] = []> = Acc['length'] extends N
-    ? Acc[number]
-    : Enumerate<N, [...Acc, Acc['length']]>;
+type Enumerate<
+  N extends number,
+  Acc extends number[] = []
+> = Acc['length'] extends N
+  ? Acc[number]
+  : Enumerate<N, [...Acc, Acc['length']]>;
 
-type IntRange<F extends number, T extends number> = Exclude<Enumerate<T>, Enumerate<F>>
-type VALID_COST = IntRange<4, 32>
-
+type IntRange<F extends number, T extends number> = Exclude<
+  Enumerate<T>,
+  Enumerate<F>
+>;
+type VALID_COST = IntRange<4, 32>;
 
 const MAX_PW_LENGTH = 72; // Maximum allowed bytes (including null terminator)
+
+/**
+ * Based on lessons learned from Bebop (https://github.com/betwixt-labs/bebop/)
+ * TextEncoder is actually really slow for small strings, so we use a custom
+ * encoder for small inputs.
+ * @param value The input string.
+ * @returns A Uint8Array containing the UTF‑8 encoding of the string.
+ */
+function encodeUtf8(value: string): Uint8Array {
+  const stringLength = value.length;
+  if (stringLength === 0) {
+    return new Uint8Array(0);
+  }
+  // value.length * 3 is an upper limit for the space taken up by the string.
+  const maxBytes = stringLength * 3;
+  const buffer = new Uint8Array(maxBytes);
+  let w = 0;
+  let codePoint: number;
+  for (let i = 0; i < stringLength; i++) {
+    const a = value.charCodeAt(i);
+    if (i + 1 === stringLength || a < 0xd800 || a >= 0xdc00) {
+      codePoint = a;
+    } else {
+      const b = value.charCodeAt(++i);
+      codePoint = (a << 10) + b + (0x10000 - (0xd800 << 10) - 0xdc00);
+    }
+    if (codePoint < 0x80) {
+      buffer[w++] = codePoint;
+    } else {
+      if (codePoint < 0x800) {
+        buffer[w++] = ((codePoint >> 6) & 0x1f) | 0xc0;
+      } else {
+        if (codePoint < 0x10000) {
+          buffer[w++] = ((codePoint >> 12) & 0x0f) | 0xe0;
+        } else {
+          buffer[w++] = ((codePoint >> 18) & 0x07) | 0xf0;
+          buffer[w++] = ((codePoint >> 12) & 0x3f) | 0x80;
+        }
+        buffer[w++] = ((codePoint >> 6) & 0x3f) | 0x80;
+      }
+      buffer[w++] = (codePoint & 0x3f) | 0x80;
+    }
+  }
+  return buffer.subarray(0, w);
+}
+
+/**
+ * Optimized ASCII encoder.
+ * Converts a string of ASCII characters into a Uint8Array.
+ * @param value The input string (assumed to be ASCII).
+ * @returns The encoded bytes.
+ */
+function asciiEncode(value: string): Uint8Array {
+  const arr = new Uint8Array(value.length);
+  for (let i = 0; i < value.length; i++) {
+    arr[i] = value.charCodeAt(i);
+  }
+  return arr;
+}
 
 /**
  * Custom error type for cryptographic assertions.
@@ -375,130 +439,162 @@ const CIPHER_TEXT: number[] = [
   0x4f727068, 0x65616e42, 0x65686f6c, 0x64657253, 0x63727944, 0x6f756274,
 ];
 
-
 /**
  * The BlowfishEngine class implements the core Blowfish cipher routines as used in bcrypt.
- * Its design closely follows the description in the bcrypt paper, including the
- * F‑function, 16-round Feistel network, and key expansion routines (enhanced key schedule).
  */
-class BlowfishEngine implements Disposable {
-  public P: number[];
-  public S: number[];
+class BlowfishEngine {
+  public P: Uint32Array;
+  public S: Uint32Array;
 
   constructor() {
-    // Clone the constant arrays to ensure each instance maintains its own state.
-    this.P = P_ORIG.slice();
-    this.S = S_ORIG.slice();
-  }
-
-  /**
-   * The Blowfish F‑function.
-   *
-   * Given a 32‑bit input, it splits the input into four 8‑bit quarters and uses these as
-   * indices into the S-boxes. It computes:
-   *
-   *    F(x) = ((S[a] + S[0x100 | b]) XOR S[0x200 | c]) + S[0x300 | d]
-   *
-   * where a, b, c, d are the 8‑bit parts of x. See Section 2 of the paper.
-   *
-   * @param x A 32‑bit unsigned integer.
-   * @returns A 32‑bit unsigned integer as the output.
-   */
-  private F(x: number): number {
-    const a = (x >>> 24) & 0xff;
-    const b = (x >>> 16) & 0xff;
-    const c = (x >>> 8) & 0xff;
-    const d = x & 0xff;
-    let res = (this.S[a] + this.S[0x100 | b]) >>> 0;
-    res = res ^ this.S[0x200 | c];
-    res = (res + this.S[0x300 | d]) >>> 0;
-    return res;
+    // Clone the constant arrays into typed arrays.
+    this.P = new Uint32Array(P_ORIG);
+    this.S = new Uint32Array(S_ORIG);
   }
 
   /**
    * Encrypts a 64‑bit block represented by two 32‑bit words.
    *
-   * This method implements the 16-round Feistel network of Blowfish. It first XORs
-   * the left half with the first P-array element, then performs 16 rounds where the
-   * right half is XORed with the F‑function of the left half and the corresponding P-array element,
-   * with a swap at each round. Finally, it applies the last P-array element.
+   * This method implements the 16‑round Feistel network of Blowfish. It first XORs
+   * the left half with the first P‑array element, then performs 16 rounds where the
+   * right half is XORed with the result of the round function and the corresponding P‑array element,
+   * with a swap at each round. Finally, it applies the last P‑array element.
+   * 
+   * The method has been unrolled for perf.
    *
-   * @param l The left 32‑bit word.
-   * @param r The right 32‑bit word.
-   * @returns A tuple [l, r] representing the encrypted block.
-   */
-  public encryptBlock(l: number, r: number): [number, number] {
-    l = l ^ this.P[0];
-    for (let i = 1; i <= 16; i++) {
-      r = r ^ (this.F(l) ^ this.P[i]);
-      [l, r] = [r, l];
-    }
-    [l, r] = [r, l];
-    r = r ^ this.P[17];
-    return [l >>> 0, r >>> 0];
-  }
-
-  /**
-   * Encrypts a 64‑bit block in-place.
-   *
-   * This function encrypts a block represented by two consecutive 32‑bit words in the array,
-   * starting at the specified offset. The encryption process follows the Blowfish algorithm's
-   * 16-round Feistel network. In each round, one half of the block is updated using the cipher's
-   * F‑function and a subkey from the P-array, and the halves are swapped. After 16 rounds, the final
-   * swap is undone and the last subkey is applied.
-   *
-   * @param lr The array containing the 64‑bit block (stored as two 32‑bit words).
+   * @param lr A Uint32Array containing the 64‑bit block (stored as two 32‑bit words).
    * @param off The starting index in the array where the block begins.
    */
-  public encipher(lr: number[], off: number): void {
-    let l = lr[off],
+  public encipher(lr: Uint32Array, off: number): void {
+    const P = this.P;
+    const S = this.S;
+    let n,
+      l = lr[off],
       r = lr[off + 1];
-    l = l ^ this.P[0];
-    let i: number, n: number;
-    for (i = 1; i <= 16; i += 2) {
-      n =
-        (this.S[(l >>> 24) & 0xff] + this.S[0x100 | ((l >>> 16) & 0xff)]) >>> 0;
-      n = n ^ this.S[0x200 | ((l >>> 8) & 0xff)];
-      n = (n + this.S[0x300 | (l & 0xff)]) >>> 0;
-      r = r ^ (n ^ this.P[i]);
+    l = l ^ P[0];
+    //0
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[1];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[2];
+    //1
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[3];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[4];
+    //2
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[5];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[6];
+    //3
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[7];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[8];
+    //4
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[9];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[10];
+    //5
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[11];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[12];
+    //6
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[13];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[14];
+    //7
+    n = S[l >>> 24];
+    n += S[0x100 | ((l >> 16) & 0xff)];
+    n ^= S[0x200 | ((l >> 8) & 0xff)];
+    n += S[0x300 | (l & 0xff)];
+    r ^= n ^ P[15];
+    n = S[r >>> 24];
+    n += S[0x100 | ((r >> 16) & 0xff)];
+    n ^= S[0x200 | ((r >> 8) & 0xff)];
+    n += S[0x300 | (r & 0xff)];
+    l ^= n ^ P[16];
 
-      n =
-        (this.S[(r >>> 24) & 0xff] + this.S[0x100 | ((r >>> 16) & 0xff)]) >>> 0;
-      n = n ^ this.S[0x200 | ((r >>> 8) & 0xff)];
-      n = (n + this.S[0x300 | (r & 0xff)]) >>> 0;
-      l = l ^ (n ^ this.P[i + 1]);
-    }
-    lr[off] = r ^ this.P[17];
+    lr[off] = r ^ P[16 + 1];
     lr[off + 1] = l;
   }
 
   /**
    * Extracts a 32‑bit word from a byte array in a cyclic manner.
    *
-   * This function reads four bytes from the input array and concatenates them into a 32‑bit word.
-   * If the end of the array is reached during this process, the extraction wraps around to the beginning
-   * of the array. The offset, provided via an object, is updated accordingly to reflect the position
-   * after reading four bytes.
+   * This method is unrolled to read four bytes from the input array (wrapping around if needed)
+   * and concatenates them into a 32‑bit word in big‑endian order.
    *
    * @param data The byte array from which the word is to be extracted.
    * @param off An object containing the current offset; it is updated after reading four bytes.
    * @returns The 32‑bit word assembled from the four bytes.
    */
   public streamToWord(data: Uint8Array, off: { offset: number }): number {
-    let word = 0;
-    for (let i = 0; i < 4; i++) {
-      word = (word << 8) | (data[off.offset] & 0xff);
-      off.offset = (off.offset + 1) % data.length;
-    }
-    return word;
+    let o = off.offset;
+    const a = data[o];
+    o = (o + 1) % data.length;
+    const b = data[o];
+    o = (o + 1) % data.length;
+    const c = data[o];
+    o = (o + 1) % data.length;
+    const d = data[o];
+    o = (o + 1) % data.length;
+    off.offset = o;
+    return ((a << 24) | (b << 16) | (c << 8) | d) >>> 0;
   }
 
   /**
    * Performs the enhanced key schedule.
    *
-   * According to the bcrypt paper, the password (key) is first XORed into the P-array.
-   * Then, the P-array and S-boxes are updated by repeatedly encrypting a block of data
-   * that is combined with the salt. This method applies both operations.
+   * According to the bcrypt paper, the password (key) is first XORed into the P‑array.
+   * Then, the P‑array and S‑boxes are updated by repeatedly encrypting a block of data
+   * that is combined with the salt.
    *
    * @param salt The salt as a byte array.
    * @param password The password as a byte array.
@@ -510,8 +606,7 @@ class BlowfishEngine implements Disposable {
     }
 
     const offS = { offset: 0 };
-    const lr: number[] = [0, 0];
-    // Update P-array in pairs
+    const lr = new Uint32Array(2);
     for (let i = 0; i < this.P.length; i += 2) {
       lr[0] = lr[0] ^ this.streamToWord(salt, offS);
       lr[1] = lr[1] ^ this.streamToWord(salt, offS);
@@ -519,7 +614,6 @@ class BlowfishEngine implements Disposable {
       this.P[i] = lr[0];
       this.P[i + 1] = lr[1];
     }
-    // Update S-boxes in pairs
     for (let i = 0; i < this.S.length; i += 2) {
       lr[0] = lr[0] ^ this.streamToWord(salt, offS);
       lr[1] = lr[1] ^ this.streamToWord(salt, offS);
@@ -532,9 +626,8 @@ class BlowfishEngine implements Disposable {
   /**
    * Standard key mixing routine.
    *
-   * This method first XORs the P-array with the provided key data and then updates the
-   * P-array and S-boxes by repeatedly encrypting an all-zero block. This is similar to the
-   * enhanced key schedule but uses only the key data (no salt) for mixing.
+   * This method first XORs the P‑array with the provided key data and then updates the
+   * P‑array and S‑boxes by repeatedly encrypting an all‑zero block.
    *
    * @param data The key data (password or salt) as a byte array.
    */
@@ -543,7 +636,7 @@ class BlowfishEngine implements Disposable {
     for (let i = 0; i < this.P.length; i++) {
       this.P[i] = this.P[i] ^ this.streamToWord(data, offP);
     }
-    const lr: number[] = [0, 0];
+    const lr = new Uint32Array(2);
     for (let i = 0; i < this.P.length; i += 2) {
       this.encipher(lr, 0);
       this.P[i] = lr[0];
@@ -556,20 +649,15 @@ class BlowfishEngine implements Disposable {
     }
   }
 
-    /**
-     * Securely disposes of sensitive state data.
-     *
-     * Zeroes out the P-array and S-boxes to prevent sensitive key material from lingering in memory.
-     */
-    [Symbol.dispose](): void {
-        for (let i = 0; i < this.P.length; i++) {
-            this.P[i] = 0;
-        }
-        for (let i = 0; i < this.S.length; i++) {
-            this.S[i] = 0;
-        }
-    }
-
+  /**
+   * Securely disposes of sensitive state data.
+   *
+   * Zeroes out the P‑array and S‑boxes to prevent sensitive key material from lingering in memory.
+   */
+  dispose(): void {
+    this.P.fill(0);
+    this.S.fill(0);
+  }
 }
 
 /**
@@ -617,44 +705,59 @@ function cryptRaw(
   salt: Uint8Array,
   password: Uint8Array
 ): Uint8Array {
-  if (rounds < 0) {
-    throw new Error('rounds must not be negative');
-  }
-  if (salt.length !== 16) {
-    throw new Error('Bad salt length');
-  }
-
-  // Clone the bcrypt IV (ciphertext) – a one-dimensional array of 6 32-bit words.
-  const cdata = CIPHER_TEXT.slice();
-  using bf = new BlowfishEngine();
-
-  // First, apply the enhanced key schedule (mixing in both password and salt)
-  bf.enhancedKeySchedule(salt, password);
-  // Then perform 2^cost rounds of key mixing as specified in the paper.
-  for (let i = 0; i < rounds; i++) {
-    bf.key(password);
-    bf.key(salt);
-  }
-  // Encrypt the IV 64 times.
-  for (let i = 0; i < 64; i++) {
-    for (let j = 0; j < cdata.length; j += 2) {
-      const lr: [number, number] = [cdata[j], cdata[j + 1]];
-      bf.encipher(lr, 0);
-      cdata[j] = lr[0];
-      cdata[j + 1] = lr[1];
+  // Clone the bcrypt IV (ciphertext) into a typed array (6 32‑bit words = 24 bytes).
+  const cdata = new Uint32Array(CIPHER_TEXT); // CIPHER_TEXT is an array of 6 numbers.
+  const bf = new BlowfishEngine();
+  try {
+    // First, apply the enhanced key schedule (mixing in both password and salt).
+    bf.enhancedKeySchedule(salt, password);
+    // Then perform 2^cost rounds of key mixing as specified in the paper.
+    for (let i = 0; i < rounds; i++) {
+      bf.key(password);
+      bf.key(salt);
     }
-  }
-  // Convert the six 32-bit words into 24 bytes.
-  const ret = new Uint8Array(cdata.length * 4);
-  let pos = 0;
-  for (let i = 0; i < cdata.length; i++) {
-    ret[pos++] = (cdata[i] >>> 24) & 0xff;
-    ret[pos++] = (cdata[i] >>> 16) & 0xff;
-    ret[pos++] = (cdata[i] >>> 8) & 0xff;
-    ret[pos++] = cdata[i] & 0xff;
-  }
+    // Encrypt the IV 64 times. Unroll the inner loop over the three 32‑bit word pairs.
+    for (let i = 0; i < 64; i++) {
+      bf.encipher(cdata, 0); // Encrypt words 0 and 1.
+      bf.encipher(cdata, 2); // Encrypt words 2 and 3.
+      bf.encipher(cdata, 4); // Encrypt words 4 and 5.
+    }
+    // Manually convert the six 32‑bit words into 24 bytes in big‑endian order.
+    const ret = new Uint8Array(24);
+    ret[0] = (cdata[0] >>> 24) & 0xff;
+    ret[1] = (cdata[0] >>> 16) & 0xff;
+    ret[2] = (cdata[0] >>> 8) & 0xff;
+    ret[3] = cdata[0] & 0xff;
 
-  return ret;
+    ret[4] = (cdata[1] >>> 24) & 0xff;
+    ret[5] = (cdata[1] >>> 16) & 0xff;
+    ret[6] = (cdata[1] >>> 8) & 0xff;
+    ret[7] = cdata[1] & 0xff;
+
+    ret[8] = (cdata[2] >>> 24) & 0xff;
+    ret[9] = (cdata[2] >>> 16) & 0xff;
+    ret[10] = (cdata[2] >>> 8) & 0xff;
+    ret[11] = cdata[2] & 0xff;
+
+    ret[12] = (cdata[3] >>> 24) & 0xff;
+    ret[13] = (cdata[3] >>> 16) & 0xff;
+    ret[14] = (cdata[3] >>> 8) & 0xff;
+    ret[15] = cdata[3] & 0xff;
+
+    ret[16] = (cdata[4] >>> 24) & 0xff;
+    ret[17] = (cdata[4] >>> 16) & 0xff;
+    ret[18] = (cdata[4] >>> 8) & 0xff;
+    ret[19] = cdata[4] & 0xff;
+
+    ret[20] = (cdata[5] >>> 24) & 0xff;
+    ret[21] = (cdata[5] >>> 16) & 0xff;
+    ret[22] = (cdata[5] >>> 8) & 0xff;
+    ret[23] = cdata[5] & 0xff;
+
+    return ret;
+  } finally {
+    bf.dispose();
+  }
 }
 
 /**
@@ -679,35 +782,40 @@ function cryptRaw(
  * console.log(hashed);
  */
 export function hash(password: string, cost: VALID_COST = 10): string {
+  cassert(
+    cost >= MIN_COST && cost <= MAX_COST,
+    `Cost factor must be between ${MIN_COST} and ${MAX_COST}.`
+  );
 
-    // Assert the cost factor is valid.
-    cassert(cost >= MIN_COST && cost <= MAX_COST, `Cost factor must be between ${MIN_COST} and ${MAX_COST}.`);
+  // Use our custom UTF‑8 encoder.
+  const passwordBytes = encodeUtf8(password);
+  cassert(passwordBytes.length > 0, 'Password must not be empty.');
+  cassert(
+    passwordBytes.length + 1 <= MAX_PW_LENGTH,
+    'Password exceeds maximum length of 72 bytes (including null terminator).'
+  );
 
-    const encoder = new TextEncoder();
-    const passwordBytes = encoder.encode(password);
-    cassert(passwordBytes.length > 0, 'Password must not be empty.');
-    // Assert that the password plus the null terminator does not exceed 72 bytes.
-    cassert(passwordBytes.length + 1 <= MAX_PW_LENGTH, 'Password exceeds maximum length of 72 bytes (including null terminator).');
+  // Append a null terminator.
+  const passwordWithNull = new Uint8Array(passwordBytes.length + 1);
+  passwordWithNull.set(passwordBytes);
+  passwordWithNull[passwordBytes.length] = 0;
 
-    // Append a null terminator (this encodes the string again).
-    const passwordWithNull = encoder.encode(password + '\x00');
+  // Generate a salt string.
+  const saltStr = genSalt(cost);
+  const parts = saltStr.split('$');
+  cassert(parts.length >= 4, 'Invalid salt format');
+  const saltEncoded = parts[3];
+  const saltBytes = decodeBase64(saltEncoded, 16);
+  cassert(saltBytes.length === 16, 'Salt must be exactly 16 bytes.');
 
-    // Generate a salt string.
-    const saltStr = genSalt(cost);
-    const parts = saltStr.split('$');
-    cassert(parts.length >= 4, 'Invalid salt format');
-    const saltEncoded = parts[3];
-    const saltBytes = decodeBase64(saltEncoded, 16);
-    cassert(saltBytes.length === 16, 'Salt must be exactly 16 bytes.');
-
-    // The actual number of rounds is 2^cost.
-    const rounds = 1 << cost;
-    const hashBytes = cryptRaw(rounds, saltBytes, passwordWithNull);
-
-    // Per the bcrypt spec, only the first 23 of the 24 bytes are used.
-    const hashEncoded = encodeBase64(hashBytes.slice(0, 23), 31);
-    const costStrFormatted = cost.toString().padStart(2, '0');
-    return `$2b$${costStrFormatted}$${saltEncoded}${hashEncoded}`;
+  // The actual number of rounds is 2^cost.
+  const rounds = 1 << cost;
+  cassert(rounds >= 0, 'Rounds must not be negative.');
+  const hashBytes = cryptRaw(rounds, saltBytes, passwordWithNull);
+  // Per the bcrypt spec, only the first 23 of the 24 bytes are used.
+  const hashEncoded = encodeBase64(hashBytes.slice(0, 23), 31);
+  const costStrFormatted = cost.toString().padStart(2, '0');
+  return `$2b$${costStrFormatted}$${saltEncoded}${hashEncoded}`;
 }
 
 /**
@@ -734,27 +842,38 @@ export function hash(password: string, cost: VALID_COST = 10): string {
  * }
  */
 export function compare(password: string, hash: string): boolean {
-    // Validate the hash format.
-    cassert(/^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$/.test(hash), 'Invalid bcrypt hash format.');
+  cassert(
+    /^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$/.test(hash),
+    'Invalid bcrypt hash format.'
+  );
 
-    const costStr = hash.substring(4, 6);
-    const cost = parseInt(costStr, 10);
-    cassert(cost >= MIN_COST && cost <= MAX_COST, `Cost factor must be between ${MIN_COST} and ${MAX_COST}.`);
+  const costStr = hash.substring(4, 6);
+  const cost = parseInt(costStr, 10);
+  cassert(
+    cost >= MIN_COST && cost <= MAX_COST,
+    `Cost factor must be between ${MIN_COST} and ${MAX_COST}.`
+  );
 
-    const saltEncoded = hash.substring(7, 29);
-    const expectedHash = hash.substring(29);
-    const encoder = new TextEncoder();
-    const passwordBytes = encoder.encode(password);
-    cassert(passwordBytes.length > 0, 'Password must not be empty.');
-    cassert(passwordBytes.length + 1 <= MAX_PW_LENGTH, 'Password exceeds maximum length of 72 bytes (including null terminator).');
+  const saltEncoded = hash.substring(7, 29);
+  const expectedHash = hash.substring(29);
 
-    // Append a null terminator (again, this encodes the password once more).
-    const passwordWithNull = encoder.encode(password + '\x00');
+  const passwordBytes = encodeUtf8(password);
+  cassert(passwordBytes.length > 0, 'Password must not be empty.');
+  cassert(
+    passwordBytes.length + 1 <= MAX_PW_LENGTH,
+    'Password exceeds maximum length of 72 bytes (including null terminator).'
+  );
 
-    const saltBytes = decodeBase64(saltEncoded, 16);
-    cassert(saltBytes.length === 16, 'Salt must be exactly 16 bytes.');
-    const rounds = 1 << cost;
-    const computedHashBytes = cryptRaw(rounds, saltBytes, passwordWithNull);
-    const computedHash = encodeBase64(computedHashBytes.slice(0, 23), 31);
-    return tse(encoder.encode(computedHash), encoder.encode(expectedHash));
+  // Append a null terminator.
+  const passwordWithNull = new Uint8Array(passwordBytes.length + 1);
+  passwordWithNull.set(passwordBytes);
+  passwordWithNull[passwordBytes.length] = 0;
+
+  const saltBytes = decodeBase64(saltEncoded, 16);
+  cassert(saltBytes.length === 16, 'Salt must be exactly 16 bytes.');
+  const rounds = 1 << cost;
+
+  const computedHashBytes = cryptRaw(rounds, saltBytes, passwordWithNull);
+  const computedHash = encodeBase64(computedHashBytes.slice(0, 23), 31);
+  return tse(asciiEncode(computedHash), asciiEncode(expectedHash));
 }
